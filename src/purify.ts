@@ -300,6 +300,11 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
   // createScriptURL calls DOMPurify.sanitize would recurse forever (#1422),
   // so re-entry throws instead.
   let IN_TRUSTED_TYPES_POLICY = 0;
+
+  // Depth of running sanitize() calls. A hook may sanitize nested markup by
+  // calling sanitize() again; such a nested call must not reconfigure the
+  // pass it runs inside (see _snapshotRuntimeState).
+  let IN_SANITIZE = 0;
   const _assertNotInTrustedTypesPolicy = function (): void {
     if (IN_TRUSTED_TYPES_POLICY > 0) {
       throw typeErrorCreate(
@@ -2660,8 +2665,122 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     }
   };
 
+  /**
+   * Snapshot the runtime state a sanitize() pass reads and writes.
+   *
+   * A hook may sanitize nested markup by calling sanitize() again. Without
+   * this, the nested call re-runs _parseConfig and overwrites every one of
+   * these bindings for the outer pass, which then continues under the
+   * nested call's configuration: allowlists, FORBID_TAGS, SAFE_FOR_TEMPLATES
+   * and KEEP_CONTENT revert to the nested values, the allowlist forks taken
+   * for hooks are lost, the config handed to outer hooks is replaced, and
+   * the outer call's removal records are reset. The nested call's own
+   * records and IN_PLACE bookkeeping are equally its own.
+   *
+   * Taken before the call mutates anything, including IS_EMPTY_INPUT.
+   *
+   * @return the state of the pass this call is nested in
+   */
+  const _snapshotRuntimeState = function () {
+    return {
+      IS_EMPTY_INPUT,
+      PARSER_MEDIA_TYPE,
+      transformCaseFunc,
+      ALLOWED_TAGS,
+      ALLOWED_ATTR,
+      ALLOWED_NAMESPACES,
+      URI_SAFE_ATTRIBUTES,
+      DATA_URI_TAGS,
+      FORBID_CONTENTS,
+      FORBID_TAGS,
+      FORBID_ATTR,
+      USE_PROFILES,
+      ALLOW_ARIA_ATTR,
+      ALLOW_DATA_ATTR,
+      ALLOW_UNKNOWN_PROTOCOLS,
+      ALLOW_SELF_CLOSE_IN_ATTR,
+      SAFE_FOR_TEMPLATES,
+      SAFE_FOR_XML,
+      WHOLE_DOCUMENT,
+      RETURN_DOM,
+      RETURN_DOM_FRAGMENT,
+      RETURN_TRUSTED_TYPE,
+      FORCE_BODY,
+      SANITIZE_DOM,
+      SANITIZE_NAMED_PROPS,
+      KEEP_CONTENT,
+      IN_PLACE,
+      IS_ALLOWED_URI,
+      NAMESPACE,
+      MATHML_TEXT_INTEGRATION_POINTS,
+      HTML_INTEGRATION_POINTS,
+      CUSTOM_ELEMENT_HANDLING,
+      tagCheck: EXTRA_ELEMENT_HANDLING.tagCheck,
+      attributeCheck: EXTRA_ELEMENT_HANDLING.attributeCheck,
+      CONFIG,
+      trustedTypesPolicy,
+      emptyHTML,
+      IN_PLACE_VISITED,
+      removed: DOMPurify.removed,
+    };
+  };
+
+  /**
+   * Put the outer pass's runtime state back after a nested call.
+   * Container references (allowlist forks, the removal record array, the
+   * IN_PLACE visit set) are restored by identity: the outer pass keeps
+   * appending to the same objects it was using. Set values are not deep
+   * copied, since the outer pass owns them and the nested call only ever
+   * replaced the bindings.
+   *
+   * @param state the snapshot taken when the nested call started
+   */
+  const _restoreRuntimeState = function (
+    state: ReturnType<typeof _snapshotRuntimeState>
+  ): void {
+    IS_EMPTY_INPUT = state.IS_EMPTY_INPUT;
+    PARSER_MEDIA_TYPE = state.PARSER_MEDIA_TYPE;
+    transformCaseFunc = state.transformCaseFunc;
+    ALLOWED_TAGS = state.ALLOWED_TAGS;
+    ALLOWED_ATTR = state.ALLOWED_ATTR;
+    ALLOWED_NAMESPACES = state.ALLOWED_NAMESPACES;
+    URI_SAFE_ATTRIBUTES = state.URI_SAFE_ATTRIBUTES;
+    DATA_URI_TAGS = state.DATA_URI_TAGS;
+    FORBID_CONTENTS = state.FORBID_CONTENTS;
+    FORBID_TAGS = state.FORBID_TAGS;
+    FORBID_ATTR = state.FORBID_ATTR;
+    USE_PROFILES = state.USE_PROFILES;
+    ALLOW_ARIA_ATTR = state.ALLOW_ARIA_ATTR;
+    ALLOW_DATA_ATTR = state.ALLOW_DATA_ATTR;
+    ALLOW_UNKNOWN_PROTOCOLS = state.ALLOW_UNKNOWN_PROTOCOLS;
+    ALLOW_SELF_CLOSE_IN_ATTR = state.ALLOW_SELF_CLOSE_IN_ATTR;
+    SAFE_FOR_TEMPLATES = state.SAFE_FOR_TEMPLATES;
+    SAFE_FOR_XML = state.SAFE_FOR_XML;
+    WHOLE_DOCUMENT = state.WHOLE_DOCUMENT;
+    RETURN_DOM = state.RETURN_DOM;
+    RETURN_DOM_FRAGMENT = state.RETURN_DOM_FRAGMENT;
+    RETURN_TRUSTED_TYPE = state.RETURN_TRUSTED_TYPE;
+    FORCE_BODY = state.FORCE_BODY;
+    SANITIZE_DOM = state.SANITIZE_DOM;
+    SANITIZE_NAMED_PROPS = state.SANITIZE_NAMED_PROPS;
+    KEEP_CONTENT = state.KEEP_CONTENT;
+    IN_PLACE = state.IN_PLACE;
+    IS_ALLOWED_URI = state.IS_ALLOWED_URI;
+    NAMESPACE = state.NAMESPACE;
+    MATHML_TEXT_INTEGRATION_POINTS = state.MATHML_TEXT_INTEGRATION_POINTS;
+    HTML_INTEGRATION_POINTS = state.HTML_INTEGRATION_POINTS;
+    CUSTOM_ELEMENT_HANDLING = state.CUSTOM_ELEMENT_HANDLING;
+    EXTRA_ELEMENT_HANDLING.tagCheck = state.tagCheck;
+    EXTRA_ELEMENT_HANDLING.attributeCheck = state.attributeCheck;
+    CONFIG = state.CONFIG;
+    trustedTypesPolicy = state.trustedTypesPolicy;
+    emptyHTML = state.emptyHTML;
+    IN_PLACE_VISITED = state.IN_PLACE_VISITED;
+    DOMPurify.removed = state.removed;
+  };
+
   // eslint-disable-next-line complexity
-  DOMPurify.sanitize = function (dirty, cfg = {}) {
+  const _sanitize = function (dirty, cfg = {}) {
     let body = null;
     let importedNode = null;
     let currentNode = null;
@@ -2889,6 +3008,36 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     }
 
     return _signOutput(serializedHTML);
+  };
+
+  /**
+   * Public entry point. A hook or a CUSTOM_ELEMENT_HANDLING predicate may
+   * sanitize nested markup by calling sanitize() again, in the middle of the
+   * pass that invoked it. The nested call must run with its own
+   * configuration and leave the outer pass exactly as it found it: allowlists,
+   * FORBID_* sets, flags, the config handed to hooks, the removal records and
+   * the IN_PLACE bookkeeping. So a nested call snapshots the runtime state
+   * first and restores it in a finally block, whether it returns or throws.
+   *
+   * The outermost call takes no snapshot. Its final state stays observable
+   * afterwards (DOMPurify.removed, and the state isValidAttribute() reads),
+   * exactly as before.
+   *
+   * @param dirty string or DOM node to sanitize
+   * @param cfg configuration for this call
+   * @return the sanitized output
+   */
+  DOMPurify.sanitize = function (dirty, cfg = {}) {
+    const outerState = IN_SANITIZE > 0 ? _snapshotRuntimeState() : null;
+    IN_SANITIZE++;
+    try {
+      return _sanitize(dirty, cfg);
+    } finally {
+      IN_SANITIZE--;
+      if (outerState) {
+        _restoreRuntimeState(outerState);
+      }
+    }
   };
 
   DOMPurify.setConfig = function (cfg = {}) {

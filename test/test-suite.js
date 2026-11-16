@@ -5376,6 +5376,445 @@
     });
 
     // =======================================================================
+    // Hooks — sanitize() called from inside a hook (nested passes)
+    //
+    // A hook, or a CUSTOM_ELEMENT_HANDLING predicate, may sanitize nested
+    // markup (for example HTML carried in an attribute value) by calling
+    // sanitize() again. That nested call runs in the middle of the outer
+    // pass. Pre-fix it re-ran _parseConfig and overwrote the outer pass's
+    // runtime state: a nested default-config call lifted the outer
+    // ALLOWED_TAGS / FORBID_TAGS / SAFE_FOR_TEMPLATES / KEEP_CONTENT back to
+    // the nested call's values, a nested ADD_TAGS widened the outer
+    // allowlist, the outer pass's removal records were replaced, and the
+    // config object handed to outer hooks was swapped.
+    //
+    // Fix: a nested sanitize() snapshots the runtime state and restores it in
+    // a finally block, on both the return and the throw path. Each test
+    // carries a control assertion — the same markup and config with an inert
+    // hook — so a change in the outer output is attributable to nesting.
+    // =======================================================================
+
+    QUnit.module(
+      'Hooks — nested sanitize() call (configuration isolation)',
+      function (hooks) {
+        let purify;
+
+        hooks.beforeEach(() => {
+          purify = DOMPurify(window);
+        });
+
+        hooks.afterEach(() => {
+          purify.removeAllHooks();
+          purify.clearConfig();
+        });
+
+        /**
+         * Sanitize `dirty` with `cfg` while a hook on `triggerTag` calls
+         * `nested()`. Runs once with the nested call and once with an inert
+         * hook on a fresh instance, and asserts both outer outputs agree.
+         *
+         * @param {Object} assert QUnit assert object
+         * @param {string} dirty outer markup
+         * @param {Object} cfg outer configuration
+         * @param {string} triggerTag tag whose hook triggers the nested call
+         * @param {Function} nested the nested sanitize() call
+         * @param {string} label message prefix
+         * @return {*} the nested call's return value
+         */
+        const withNested = function (
+          assert,
+          dirty,
+          cfg,
+          triggerTag,
+          nested,
+          label
+        ) {
+          let armed = false;
+          let nestedResult;
+          purify.addHook('uponSanitizeElement', (node) => {
+            if (armed || node.nodeName !== triggerTag) {
+              return;
+            }
+
+            armed = true;
+            nestedResult = nested();
+          });
+          const nestedOut = purify.sanitize(dirty, cfg);
+          purify.removeAllHooks();
+
+          // Control: same markup and config, no nested call on the way.
+          const control = DOMPurify(window);
+          control.addHook('uponSanitizeElement', () => {});
+          const controlOut = control.sanitize(dirty, cfg);
+          control.removeAllHooks();
+
+          assert.equal(
+            nestedOut,
+            controlOut,
+            label + ' — outer output unaffected by nesting'
+          );
+          return nestedResult;
+        };
+
+        QUnit.test(
+          'nested ADD_TAGS does not widen the outer allowlist',
+          (assert) => {
+            const nestedResult = withNested(
+              assert,
+              '<div>a</div><x-inner>o</x-inner>',
+              {},
+              'DIV',
+              () =>
+                purify.sanitize('<x-inner>n</x-inner>', {
+                  ADD_TAGS: ['x-inner'],
+                }),
+              'nested ADD_TAGS'
+            );
+
+            assert.equal(
+              nestedResult,
+              '<x-inner>n</x-inner>',
+              'nested pass applies its own ADD_TAGS'
+            );
+            assert.equal(
+              purify.sanitize('<x-inner>o</x-inner>'),
+              'o',
+              'allowlist reverts after the nested call'
+            );
+          }
+        );
+
+        QUnit.test(
+          'nested default-config call does not lift the outer FORBID_TAGS',
+          (assert) => {
+            withNested(
+              assert,
+              '<div>a</div><img src="x" onerror="alert(1)">',
+              { FORBID_TAGS: ['img'] },
+              'DIV',
+              () => purify.sanitize('<b>n</b>'),
+              'nested default config'
+            );
+
+            assert.equal(
+              purify.sanitize('<img src="x" onerror="alert(1)">', {
+                FORBID_TAGS: ['img'],
+              }),
+              '',
+              'FORBID_TAGS still wins after the nested call'
+            );
+          }
+        );
+
+        QUnit.test(
+          'nested call does not reset the outer KEEP_CONTENT',
+          (assert) => {
+            withNested(
+              assert,
+              '<p>x</p><div>drop</div>',
+              { ALLOWED_TAGS: ['p'], KEEP_CONTENT: false },
+              'DIV',
+              () => purify.sanitize('<b>n</b>'),
+              'nested KEEP_CONTENT reset'
+            );
+          }
+        );
+
+        QUnit.test(
+          'nested call does not reset SAFE_FOR_TEMPLATES',
+          (assert) => {
+            withNested(
+              assert,
+              '<div>a</div><p>{{x}}</p>',
+              { SAFE_FOR_TEMPLATES: true },
+              'DIV',
+              () => purify.sanitize('<b>n</b>'),
+              'nested SAFE_FOR_TEMPLATES reset'
+            );
+          }
+        );
+
+        QUnit.test('outer removal records survive a nested call', (assert) => {
+          let nestedRemoved = null;
+          let armed = false;
+          let inNested = false;
+
+          /* The outer pass removes onclick from the <a> before the walk
+               reaches the <div>. The nested pass then resets and fills
+               DOMPurify.removed; captured from inside the nested pass, as the
+               nested array is not observable once the outer state is back. */
+          purify.addHook('uponSanitizeElement', (node) => {
+            if (armed || node.nodeName !== 'DIV') {
+              return;
+            }
+
+            armed = true;
+            inNested = true;
+            try {
+              purify.sanitize('<img src="x" onerror="alert(2)">');
+            } finally {
+              inNested = false;
+            }
+          });
+          purify.addHook('afterSanitizeAttributes', (node) => {
+            if (inNested && node.nodeName === 'IMG') {
+              nestedRemoved = purify.removed.map((entry) =>
+                entry.attribute ? entry.attribute.name : entry.element.nodeName
+              );
+            }
+          });
+
+          const outer = purify.sanitize(
+            '<a onclick="alert(1)">t</a><div>d</div>'
+          );
+          const removedNames = purify.removed.map((entry) =>
+            entry.attribute ? entry.attribute.name : entry.element.nodeName
+          );
+
+          assert.equal(outer, '<a>t</a><div>d</div>', 'outer output');
+          assert.deepEqual(
+            nestedRemoved,
+            ['onerror'],
+            'nested pass sees only its own removals'
+          );
+          assert.deepEqual(
+            removedNames,
+            ['onclick'],
+            'outer pass keeps the removal it made before the nested call'
+          );
+        });
+
+        QUnit.test(
+          'outer hooks keep receiving the outer configuration object',
+          (assert) => {
+            let armed = false;
+            let beforeNested;
+            let afterNested;
+            purify.addHook('uponSanitizeElement', (node, data, config) => {
+              if (node.nodeName === 'DIV' && !armed) {
+                armed = true;
+                beforeNested = config;
+                purify.sanitize('<b>n</b>', { ALLOWED_TAGS: ['b'] });
+                return;
+              }
+
+              if (node.nodeName === 'SPAN') {
+                afterNested = config;
+              }
+            });
+
+            purify.sanitize('<div>a</div><span>s</span>', {
+              FORBID_TAGS: ['img'],
+            });
+
+            assert.strictEqual(
+              afterNested,
+              beforeNested,
+              'same config object before and after the nested call'
+            );
+            assert.notOk(
+              'ALLOWED_TAGS' in afterNested,
+              'nested ALLOWED_TAGS did not replace the outer config'
+            );
+            assert.deepEqual(
+              afterNested.FORBID_TAGS,
+              ['img'],
+              'outer FORBID_TAGS still reported to hooks'
+            );
+          }
+        );
+
+        QUnit.test(
+          'setConfig: nested per-call config does not leak into the outer pass',
+          (assert) => {
+            purify.setConfig({
+              ALLOWED_TAGS: ['div', 'span'],
+              ALLOWED_ATTR: [],
+            });
+            let armed = false;
+            let nestedResult;
+            purify.addHook('uponSanitizeElement', (node) => {
+              if (armed || node.nodeName !== 'DIV') {
+                return;
+              }
+
+              armed = true;
+              nestedResult = purify.sanitize('<b>n</b>', {
+                ALLOWED_TAGS: ['b'],
+              });
+            });
+
+            assert.equal(
+              purify.sanitize('<div>a</div><b>later</b><span>s</span>'),
+              '<div>a</div>later<span>s</span>',
+              'outer pass keeps the persistent allowlist'
+            );
+            assert.equal(
+              nestedResult,
+              'n',
+              'nested pass under setConfig ignores its per-call config, as documented'
+            );
+            assert.equal(
+              purify.sanitize('<span>s2</span><b>b</b>'),
+              '<span>s2</span>b',
+              'persistent config still in effect afterwards'
+            );
+          }
+        );
+
+        QUnit.test(
+          'nested call that throws still restores the outer pass',
+          (assert) => {
+            let armed = false;
+            let nestedError = null;
+            purify.addHook('uponSanitizeElement', (node) => {
+              if (armed || node.nodeName !== 'DIV') {
+                return;
+              }
+
+              armed = true;
+
+              // A forbidden IN_PLACE root throws after neutralizing itself.
+              const forbidden = document.createElement('script');
+              try {
+                purify.sanitize(forbidden, { IN_PLACE: true });
+              } catch (error) {
+                nestedError = error;
+              }
+            });
+
+            assert.equal(
+              purify.sanitize('<div>a</div><img src="x">', {
+                FORBID_TAGS: ['img'],
+              }),
+              '<div>a</div>',
+              'outer pass completes under its own config'
+            );
+            assert.ok(nestedError instanceof TypeError, 'nested call threw');
+            assert.deepEqual(
+              purify.removed.map((entry) =>
+                entry.element ? entry.element.nodeName : entry.attribute.name
+              ),
+              ['IMG'],
+              'outer removal records intact after the nested throw'
+            );
+          }
+        );
+
+        QUnit.test(
+          'nested in-place pass does not disturb the outer visit tracking',
+          (assert) => {
+            let armed = false;
+            let nestedOutput;
+            purify.addHook('uponSanitizeElement', (node) => {
+              if (armed || node.nodeName !== 'DIV') {
+                return;
+              }
+
+              armed = true;
+
+              const holder = document.createElement('div');
+              holder.innerHTML =
+                '<a href="javascript:alert(1)">n</a><img src="x" onerror="alert(2)">';
+              purify.sanitize(holder, { IN_PLACE: true });
+              nestedOutput = holder.innerHTML;
+            });
+
+            const root = document.createElement('div');
+            root.innerHTML =
+              '<div><a href="javascript:alert(1)">x</a></div><div><b onclick="alert(2)">y</b></div>';
+            purify.sanitize(root, { IN_PLACE: true });
+
+            assert.equal(
+              nestedOutput,
+              '<a>n</a><img src="x">',
+              'nested in-place pass sanitized its own tree'
+            );
+            assert.equal(
+              root.innerHTML,
+              '<div><a>x</a></div><div><b>y</b></div>',
+              'outer in-place tree fully sanitized, nodes after the hook included'
+            );
+          }
+        );
+
+        QUnit.test(
+          'outer in-place pass with a nested copy-based call keeps its config',
+          (assert) => {
+            let armed = false;
+            const nestedOutputs = [];
+            purify.addHook('uponSanitizeElement', (node) => {
+              if (armed || node.nodeName !== 'DIV') {
+                return;
+              }
+
+              armed = true;
+              nestedOutputs.push(
+                purify.sanitize(
+                  '<a href="javascript:alert(1)">s</a><img src="y" onerror="alert(2)">'
+                )
+              );
+            });
+
+            const root = document.createElement('div');
+            root.innerHTML =
+              '<div><a href="javascript:alert(1)">1</a></div>' +
+              '<div><b onclick="alert(2)">2</b></div>' +
+              '<img src="x" onerror="alert(3)">';
+            purify.sanitize(root, {
+              IN_PLACE: true,
+              FORBID_TAGS: ['img'],
+            });
+
+            assert.equal(
+              nestedOutputs[0],
+              '<a>s</a><img src="y">',
+              'nested copy-based pass sanitized its own tree'
+            );
+            assert.equal(
+              root.innerHTML,
+              '<div><a>1</a></div><div><b>2</b></div>',
+              'outer in-place pass kept FORBID_TAGS after the nested call'
+            );
+            assert.equal(
+              purify.removed.length,
+              3,
+              'outer removal records survived the nested call'
+            );
+          }
+        );
+
+        QUnit.test(
+          'a hook may sanitize markup carried in an attribute value (documented use)',
+          (assert) => {
+            purify.addHook('uponSanitizeAttribute', (node, hookEvent) => {
+              if (hookEvent.attrName === 'data-fragment') {
+                hookEvent.attrValue = purify.sanitize(hookEvent.attrValue, {
+                  ALLOWED_TAGS: ['b'],
+                  ALLOWED_ATTR: [],
+                });
+              }
+            });
+
+            assert.equal(
+              purify.sanitize(
+                '<div data-fragment="<b>ok</b><script>alert(1)</script>"></div>'
+              ),
+              '<div data-fragment="&lt;b&gt;ok&lt;/b&gt;"></div>',
+              'nested fragment sanitized with the nested config, ' +
+                'and serialized escaped'
+            );
+            assert.equal(
+              purify.sanitize('<script>alert(1)</script>'),
+              '',
+              'nested ALLOWED_TAGS did not leak into the next call'
+            );
+          }
+        );
+      }
+    );
+
+    // =======================================================================
     // Hooks — shadow roots nested inside <template>.content
     //
     // Two patches landed together to close a class of bypasses:

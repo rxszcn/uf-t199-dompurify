@@ -530,11 +530,11 @@ DOMPurify.addHook(
 
 ### A note on calling `sanitize()` from a hook
 
-**`DOMPurify.sanitize()` is not re-entrant.** Please do not call it from inside a hook, or from a configuration callback such as `CUSTOM_ELEMENT_HANDLING.tagNameCheck` or `attributeNameCheck`. Those callbacks run in the _middle_ of an active sanitizer pass.
+A hook, or a configuration callback such as `CUSTOM_ELEMENT_HANDLING.tagNameCheck` or `attributeNameCheck`, may sanitize nested markup — an HTML fragment carried inside an attribute value, for example — by calling `sanitize()` again while the outer pass is still running.
 
-A nested `sanitize()` call re-reads the configuration handed to it and, in doing so, **replaces the configuration the outer pass is still using**. The rest of the outer document is then sanitized against the nested call's configuration instead of yours. Since the nested call typically runs with the default configuration, a strict `ALLOWED_TAGS` allow-list can silently widen back to the default one part-way through a document, with no error and no warning.
+A nested call is isolated: it runs under **its own** configuration, and the outer pass resumes under the configuration it started with. The nested call cannot change the outer pass's allowlists, `FORBID_TAGS` / `FORBID_ATTR`, flags such as `SAFE_FOR_TEMPLATES`, `KEEP_CONTENT` or `SANITIZE_NAMED_PROPS`, the config object passed to the outer pass's hooks, or the outer pass's `DOMPurify.removed` records. Both the success and the throw path restore the outer state, so a nested call that throws (for example, sanitizing a forbidden node in `IN_PLACE` mode) leaves the outer pass intact.
 
-If you need to sanitize nested markup, for example an HTML fragment carried inside an attribute value, you have two safe options. Either set your configuration once with [`DOMPurify.setConfig`](#persistent-configuration) instead of passing it per call, since a persistent configuration is shared by the nested call and stays in effect for the whole pass; or collect the fragments during the hook and sanitize them with a separate `sanitize()` call _after_ the outer one has returned.
+Prefer keeping nested fragments small. Each nested call is a full sanitizer pass, and a hook that unconditionally calls `sanitize()` recurses without bound. If you do not need the nested call to run immediately, collecting the fragments during the hook and sanitizing them after the outer call has returned is still the cheapest option.
 
 ## Removed Configuration
 
